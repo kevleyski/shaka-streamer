@@ -33,6 +33,7 @@ from mypy import api as mypy_api
 from streamer import node_base
 from streamer.controller_node import ControllerNode
 from streamer.configuration import ConfigError
+from werkzeug.utils import secure_filename
 
 OUTPUT_DIR = 'output_files/'
 TEST_DIR = 'test_assets/'
@@ -46,10 +47,14 @@ log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 # Changes relative path to where this file is.
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
 controller = None
+use_system_binaries = False
 
-app = flask.Flask(__name__)
+# Flask was unable to autofind the root_path correctly after an os.chdir() from another directory
+# Dunno why,refer to https://stackoverflow.com/questions/35864584/error-no-such-file-or-directory-when-using-os-chdir-in-flask
+app = flask.Flask(__name__, root_path=BASE_DIR)
 # Stops browser from caching files to prevent cross-test contamination.
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
@@ -88,9 +93,17 @@ def dashStreamsReady(manifest_path):
   pattern = re.compile(r'<Representation.*?((\n).*?)*?Representation>')
   with open(manifest_path) as manifest_file:
     for representation in pattern.finditer(manifest_file.read()):
-      if not re.search(r'<S t', representation.group()):
-        # This Representation has no segments.
-        return False
+      if controller.is_low_latency_dash_mode():
+        # LL-DASH manifests do not contain the segment reference tag <S>.
+        # Check for the availabilityTimeOffset attribute instead.
+        if not re.search(r'availabilityTimeOffset', representation.group()):
+          # This Representation does not have a availabilityTimeOffset yet,
+          # meaning the first chunk is not yet ready for playout.
+          return False
+      else:
+        if not re.search(r'<S t', representation.group()):
+          # This Representation has no segments.
+          return False
 
   return True
 
@@ -122,7 +135,9 @@ def hlsStreamsReady(master_playlist_path):
     return False
 
   for playlist_path in playlist_list:
-    if playlist_path == master_playlist_path:
+    # Use os.path.samefile method instead of the == operator because
+    # this might be a windows machine.
+    if os.path.samefile(playlist_path, master_playlist_path):
       # Skip the master playlist
       continue
 
@@ -152,11 +167,12 @@ def start():
 
   controller = ControllerNode()
   try:
-    controller.start(OUTPUT_DIR,
+    controller.start(configs['output_location'],
                      configs['input_config'],
                      configs['pipeline_config'],
                      configs['bitrate_config'],
-                     check_deps=False)
+                     check_deps=False,
+                     use_hermetic=not use_system_binaries)
   except Exception as e:
     # If the controller throws an exception during startup, we want to call
     # stop() to shut down any external processes that have already been started.
@@ -174,8 +190,15 @@ def start():
       })
       return createCrossOriginResponse(
           status=418, mimetype='application/json', body=body)
+    elif isinstance(e, RuntimeError):
+      body = json.dumps({
+        'error_type': 'RuntimeError',
+        'message': str(e),
+      })
+      return createCrossOriginResponse(
+          status=418, mimetype='application/json', body=body)
     else:
-      traceback.print_exc()
+      print('EXCEPTION', repr(e), traceback.format_exc(), flush=True)
       return createCrossOriginResponse(status=500, body=str(e))
 
   return createCrossOriginResponse()
@@ -195,6 +218,7 @@ def stop():
 
 @app.route('/output_files/<path:filename>', methods = ['GET', 'OPTIONS'])
 def send_file(filename):
+  filename = secure_filename(filename)
   if not controller:
     return createCrossOriginResponse(
         status=403, body='Instance already shut down!')
@@ -222,7 +246,7 @@ def send_file(filename):
 
   # Sending over requested files.
   try:
-    response = flask.send_file(OUTPUT_DIR + filename);
+    response = flask.send_file(OUTPUT_DIR + filename)
   except FileNotFoundError:
     response = flask.Response(response='File not found', status=404)
 
@@ -256,7 +280,16 @@ def main():
                       help='Number of trials to run')
   parser.add_argument('--reporters', nargs='+',
                       help='Enables specified reporters in karma')
+  parser.add_argument('--use-system-binaries',
+                      action='store_true',
+                      help='Use FFmpeg, FFprobe and Shaka Packager binaries ' +
+                           'found in PATH instead of the ones offered by ' +
+                           'Shaka Streamer.')
+
   args = parser.parse_args()
+
+  global use_system_binaries
+  use_system_binaries = args.use_system_binaries
 
   # Do static type checking on the project first.
   type_check_result = mypy_api.run(['streamer/'])
@@ -266,7 +299,8 @@ def main():
     return 1
 
   # Install test dependencies.
-  subprocess.check_call(['npm', 'install'])
+  install_deps_command = ['npm', 'ci']
+  subprocess.check_call(install_deps_command)
 
   # Fetch streams used in tests.
   if not os.path.exists(TEST_DIR):
@@ -287,6 +321,7 @@ def main():
   for i in range(trials):
     # Start up karma.
     karma_args = [
+        'node',
         'node_modules/karma/bin/karma',
         'start',
         'tests/karma.conf.js',

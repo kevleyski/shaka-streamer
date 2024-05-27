@@ -75,6 +75,40 @@ class MalformedField(ConfigError):
     return 'In {}, {} field is malformed: {}'.format(
         self.class_name, self.field_name, self.reason)
 
+class ConflictingFields(ConfigError):
+  """An error raised when multiple fields are given and only one of them is allowed at a time."""
+  
+  def __init__(self, class_ref, field1_name, field2_name):
+    self.field1_name = field1_name
+    self.field1_type = class_ref.__dict__[field1_name].get_type_name()
+    self.field2_name = field2_name
+    self.field2_type = class_ref.__dict__[field2_name].get_type_name()
+    super().__init__(class_ref, field1_name, class_ref.__dict__[field1_name])
+  
+  def __str__(self):
+    return """In {}, these fields are conflicting:
+    {} a {}
+    and
+    {} a {}\n  consider using only one of them.""".format(self.class_name,
+                      self.field1_name, self.field1_type,
+                      self.field2_name, self.field2_type)
+    
+class MissingRequiredExclusiveFields(ConfigError):
+  """An error raised when one of an exclusively required fields is missing."""
+  
+  def __init__(self, class_ref, field1_name, field2_name):
+    self.field1_name = field1_name
+    self.field1_type = class_ref.__dict__[field1_name].get_type_name()
+    self.field2_name = field2_name
+    self.field2_type = class_ref.__dict__[field2_name].get_type_name()
+    super().__init__(class_ref, field1_name, class_ref.__dict__[field1_name])
+  
+  def __str__(self):
+    return """{} is missing a required field. Use exactly one of these fields:
+    {} a {}
+    or
+    {} a {}""".format(self.class_name, self.field1_name, self.field1_type,
+                      self.field2_name, self.field2_type)
 
 class ValidatingType(metaclass=abc.ABCMeta):
   """A base wrapper type that validates the input against a limited range.
@@ -195,7 +229,7 @@ class Field(Generic[FieldType]):
     # original type.  If this doesn't exist, you are probably dealing with a
     # basic type like "str" or "int".
     if hasattr(type, '__origin__'):
-      return type.__origin__  # type: ignore
+      return type.__origin__ or type  # type: ignore
 
     return type
 
@@ -212,7 +246,7 @@ class Field(Generic[FieldType]):
     # is something like "str" or "int" instead of "typing.List" or
     # "typing.Dict".
     if hasattr(typing, 'get_args'):
-      args = typing.get_args(type)
+      args = typing.get_args(type)  # type: ignore
     elif hasattr(type, '__args__'):
       # Before Python 3.8, you can use this undocumented attribute to get the
       # type parameters.  If this doesn't exist, you are probably dealing with a
@@ -222,9 +256,9 @@ class Field(Generic[FieldType]):
       args = ()
 
     underlying = Field.get_underlying_type(type)
-    if underlying is dict:
+    if underlying in [dict, Dict]:
       return cast(Tuple[Optional[Type], Optional[Type]], args)
-    if underlying is list:
+    if underlying in [list, List]:
       return (None, args[0])
     return (None, None)
 
@@ -238,11 +272,11 @@ class Field(Generic[FieldType]):
     if type is str:
       # Call it a string, not a "str".
       return 'string'
-    elif type is list:
+    elif type in [list, List]:
       # Mention the subtype.
       return 'list of {}'.format(
           Field.get_type_name_static(subtype, None, None))
-    elif type is dict:
+    elif type in [dict, Dict]:
       # Mention the subtype.
       return 'dictionary of {} to {}'.format(
           Field.get_type_name_static(keytype, None, None),
@@ -324,7 +358,7 @@ class Base(object):
 
     # For fields containing other config objects, specially check and convert
     # them.
-    assert field.type is not None
+    assert field.type is not None, 'No type info for Field {}'.format(key)
     if issubclass(field.type, Base):
       # A config object at this stage should be a dictionary.
       if not isinstance(value, dict):
@@ -338,7 +372,7 @@ class Base(object):
 
     # For lists, check the type of the value itself, then check the subtype of
     # the list items.
-    if field.type is list:
+    if field.type in [list, List]:
       if not isinstance(value, list):
         raise WrongType(self.__class__, key, field)
 
@@ -355,7 +389,7 @@ class Base(object):
 
     # For dictionaries, check the type of the value itself, then check the
     # type of the dictionary keys, then the type of the dictionary values.
-    if field.type is dict:
+    if field.type in [dict, Dict]:
       if not isinstance(value, dict):
         raise WrongType(self.__class__, key, field)
 
@@ -464,6 +498,8 @@ class RuntimeMap(Generic[RuntimeMapSubclass], Base):
   def __lt__(self, other: Any) -> bool:
     return self._sortable_properties() < other._sortable_properties()
 
+  def __hash__(self) -> int:
+      return super().__hash__()
 
   @classmethod
   def set_map(cls,
@@ -527,5 +563,5 @@ class RuntimeMapKeyValidator(ValidatingType, str):
 
     if key not in cls.map_class.keys():
       raise ValueError(
-          '{} is not a valid {}'.format(key, cls.map_class.__name__))
+          '{} is not a valid {}'.format(key, cls.name()))
 

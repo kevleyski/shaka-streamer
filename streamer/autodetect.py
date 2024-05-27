@@ -18,7 +18,8 @@ import shlex
 import subprocess
 import time
 
-from streamer.bitrate_configuration import VideoResolution, VideoResolutionName
+from streamer.bitrate_configuration import (AudioChannelLayout, AudioChannelLayoutName,
+                                            VideoResolution, VideoResolutionName)
 from streamer.input_configuration import Input, InputType
 from typing import Optional, List
 
@@ -27,6 +28,9 @@ TYPES_WE_CANT_PROBE = [
   InputType.EXTERNAL_COMMAND,
 ]
 
+# This module level variable might be set by the controller node
+# if the user chooses to use the shaka streamer bundled binaries.
+hermetic_ffprobe: Optional[str] = None
 
 def _probe(input: Input, field: str) -> Optional[str]:
   """Autodetect some feature of the input, if possible, using ffprobe.
@@ -45,7 +49,8 @@ def _probe(input: Input, field: str) -> Optional[str]:
 
   args: List[str] = [
       # Probe this input file
-      'ffprobe', input.name,
+      hermetic_ffprobe or 'ffprobe',
+      input.name,
   ]
 
   # Add any required input arguments for this input type
@@ -63,18 +68,28 @@ def _probe(input: Input, field: str) -> Optional[str]:
   print('+ ' + ' '.join([shlex.quote(arg) for arg in args]))
 
   output_bytes: bytes = subprocess.check_output(args, stderr=subprocess.DEVNULL)
-  # The output is either the language code or just a blank line.
-  output_string: Optional[str] = output_bytes.decode('utf-8').strip()
+  # The output is either some probe information or just a blank line.
+  output_string: str = output_bytes.decode('utf-8').strip()
+  # With certain container formats, ffprobe returns a duplicate
+  # output and some empty lines in between. Issue #119
+  output_string = output_string.split('\n')[0]
   # After stripping the newline, we can fall back to None if it's empty.
-  output_string = output_string or None
+  probe_output: Optional[str] = output_string or None
 
   # Webcams on Linux seem to behave badly if the device is rapidly opened and
   # closed.  Therefore, sleep for 1 second after a webcam probe.
   if input.input_type == InputType.WEBCAM:
     time.sleep(1)
 
-  return output_string
+  return probe_output
 
+def is_present(input: Input) -> bool:
+  """Returns true if the stream for this input is indeed found.
+
+  If we can't probe this input type, assume it is present."""
+
+  return bool(_probe(input, 'stream=index') or
+              input.input_type in TYPES_WE_CANT_PROBE)
 
 def get_language(input: Input) -> Optional[str]:
   """Returns the autodetected the language of the input."""
@@ -99,14 +114,15 @@ def get_interlaced(input: Input) -> bool:
 def get_frame_rate(input: Input) -> Optional[float]:
   """Returns the autodetected frame rate of the input."""
 
-  frame_rate_string = _probe(input, 'stream=r_frame_rate')
+  frame_rate_string = _probe(input, 'stream=avg_frame_rate')
   if frame_rate_string is None:
     return None
 
   # This string is the framerate in the form of a fraction, such as '24/1' or
-  # '30000/1001'.  We must split it into pieces and do the division to get a
+  # '30000/1001'.  Occasionally, there is a pipe after the framerate, such as
+  # '32700/1091|'.  We must split it into pieces and do the division to get a
   # float.
-  fraction = frame_rate_string.split('/')
+  fraction = frame_rate_string.rstrip('|').split('/')
   if len(fraction) == 1:
     frame_rate = float(fraction[0])
   else:
@@ -130,9 +146,10 @@ def get_resolution(input: Input) -> Optional[VideoResolutionName]:
     return None
 
   # This is the resolution of the video in the form of 'WIDTH|HEIGHT'.  For
-  # example, '1920|1080'.  We have to split up width and height and match that
+  # example, '1920|1080'.  Occasionally, there is a pipe after the resolution, 
+  # such as '1920|1080|'.  We have to split up width and height and match that
   # to a named resolution.
-  width_string, height_string = resolution_string.split('|')
+  width_string, height_string = resolution_string.rstrip('|').split('|')
   width, height = int(width_string), int(height_string)
 
   for bucket in VideoResolution.sorted_values():
@@ -143,3 +160,16 @@ def get_resolution(input: Input) -> Optional[VideoResolutionName]:
 
   return None
 
+def get_channel_layout(input: Input) -> Optional[AudioChannelLayoutName]:
+  """Returns the autodetected channel count of the input."""
+
+  channel_count_string = _probe(input, 'stream=channels')
+  if channel_count_string is None:
+    return None
+
+  channel_count = int(channel_count_string)
+  for bucket in AudioChannelLayout.sorted_values():
+    if channel_count <= bucket.max_channels:
+      return bucket.get_key()
+
+  return None

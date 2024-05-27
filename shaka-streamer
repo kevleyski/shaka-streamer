@@ -21,12 +21,11 @@ Shaka Streamer offers a simple config-file based approach to preparing streaming
 media. It greatly simplifies the process of using FFmpeg and Shaka Packager for
 both VOD and live content.
 
-Full documentation can be found at https://google.github.io/shaka-streamer/
+Full documentation can be found at
+https://shaka-project.github.io/shaka-streamer/
 """
 
 import argparse
-import os
-import shutil
 import sys
 import time
 import yaml
@@ -51,39 +50,39 @@ def main():
   parser = argparse.ArgumentParser(description=description,
                                    formatter_class=CustomArgParseFormatter)
 
-  parser.add_argument('-i', '--input_config',
+  parser.add_argument('-i', '--input-config',
                       required=True,
                       help='The path to the input config file (required).')
-  parser.add_argument('-p', '--pipeline_config',
+  parser.add_argument('-p', '--pipeline-config',
                       required=True,
                       help='The path to the pipeline config file (required).')
-  parser.add_argument('-b', '--bitrate_config',
+  parser.add_argument('-b', '--bitrate-config',
                       help='The path to a config file which defines custom ' +
                            'bitrates and resolutions for transcoding. ' +
                            '(optional, see example in ' +
                            'config_files/bitrate_config.yaml)')
-  parser.add_argument('-c', '--cloud_url',
+  parser.add_argument('-c', '--cloud-url',
                       default=None,
                       help='The Google Cloud Storage or Amazon S3 URL to ' +
                            'upload to.  (Starts with gs:// or s3://)')
   parser.add_argument('-o', '--output',
                       default='output_files',
-                      help='The output folder to write files to. ' +
+                      help='The output folder to write files to, or an HTTP ' +
+                           'or HTTPS URL where files will be PUT.' +
                            'Used even if uploading to cloud storage.')
-  parser.add_argument('--skip_deps_check',
+  parser.add_argument('--skip-deps-check',
                       action='store_true',
-                      default=False,
                       help='Skip checks for dependencies and their versions. ' +
                            'This can be useful for testing pre-release ' +
                            'versions of FFmpeg or Shaka Packager.')
+  parser.add_argument('--use-system-binaries',
+                      action='store_true',
+                      help='Use FFmpeg, FFprobe and Shaka Packager binaries ' +
+                           'found in PATH instead of the ones offered by ' +
+                           'Shaka Streamer.')
 
   args = parser.parse_args()
 
-  # Check if the directory for outputted Packager files exists, and if it
-  # does, delete it and remake a new one.
-  if os.path.exists(args.output):
-    shutil.rmtree(args.output)
-  os.mkdir(args.output)
 
   controller = streamer.controller_node.ControllerNode()
 
@@ -105,7 +104,8 @@ def main():
   try:
     with controller.start(args.output, input_config_dict, pipeline_config_dict,
                           bitrate_config_dict, args.cloud_url,
-                          not args.skip_deps_check):
+                          not args.skip_deps_check,
+                          not args.use_system_binaries):
       # Sleep so long as the pipeline is still running.
       while True:
         status = controller.check_status()

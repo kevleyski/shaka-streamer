@@ -33,19 +33,26 @@ audio_codecs:
 video_codecs:
   - h264
 
-# Manifest format (dash, hls, or both)
+# Manifest format must be DASH for LL-DASH streaming
 manifest_format:
   - dash
-  - hls
 
 # Length of each segment in seconds.
-segment_size: 4
+segment_size: 2
 
 # Availability window, or the number of seconds a segment remains available.
 availability_window: 300
 
 # Presentation delay, or how far back from the edge the player should be.
-presentation_delay: 30
+presentation_delay: 0
 
 # Update period, or how often the player should fetch a new manifest.
 update_period: 8
+
+# Stream in low latency dash mode, or chunked 
+low_latency_dash_mode: True
+
+# UTC timing values, or the global timing source used for segment time stamps.
+utc_timings:
+ - scheme_id_uri: urn:mpeg:dash:utc:http-xsdate:2014
+   value: https://akamai.com/?.iso

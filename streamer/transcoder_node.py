@@ -17,26 +17,31 @@
 import shlex
 
 from streamer.bitrate_configuration import AudioCodec, VideoCodec
-from streamer.input_configuration import Input, InputConfig, InputType, MediaType
+from streamer.input_configuration import Input, InputType, MediaType
 from streamer.node_base import PolitelyWaitOnFinish
 from streamer.output_stream import AudioOutputStream, OutputStream, TextOutputStream, VideoOutputStream
 from streamer.pipeline_configuration import PipelineConfig, StreamingMode
-from typing import List, Union
+from typing import List, Union, Optional
 
 class TranscoderNode(PolitelyWaitOnFinish):
 
   def __init__(self,
-               input_config: InputConfig,
+               inputs: List[Input],
                pipeline_config: PipelineConfig,
-               outputs: List[OutputStream]) -> None:
+               outputs: List[OutputStream],
+               index: int,
+               hermetic_ffmpeg: Optional[str]) -> None:
     super().__init__()
-    self._input_config = input_config
+    self._inputs = inputs
     self._pipeline_config = pipeline_config
     self._outputs = outputs
+    self._index = index
+    # If a hermetic ffmpeg is passed, use it.
+    self._ffmpeg = hermetic_ffmpeg or 'ffmpeg'
 
   def start(self) -> None:
     args = [
-        'ffmpeg',
+        self._ffmpeg,
         # Do not prompt for output files that already exist. Since we created
         # the named pipe in advance, it definitely already exists. A prompt
         # would block ffmpeg to wait for user input.
@@ -59,7 +64,7 @@ class TranscoderNode(PolitelyWaitOnFinish):
             '-vaapi_device', '/dev/dri/renderD128',
         ]
 
-    for input in self._input_config.inputs:
+    for input in self._inputs:
       # Get any required input arguments for this input.
       # These are like hard-coded extra_input_args for certain input types.
       # This means users don't have to know much about FFmpeg options to handle
@@ -106,10 +111,10 @@ class TranscoderNode(PolitelyWaitOnFinish):
       # The input name always comes after the applicable input arguments.
       args += [
           # The input itself.
-          '-i', input.get_path_for_transcode(),
+          '-i', input.name,
       ]
 
-    for i, input in enumerate(self._input_config.inputs):
+    for i, input in enumerate(self._inputs):
       map_args = [
           # Map corresponding input stream to output file.
           # The format is "<INPUT FILE NUMBER>:<STREAM SPECIFIER>", so "i" here
@@ -123,7 +128,7 @@ class TranscoderNode(PolitelyWaitOnFinish):
         if output_stream.input != input:
           # Skip outputs that don't match this exact input object.
           continue
-        if output_stream.pipe is None:
+        if output_stream.skip_transcoding:
           # This input won't be transcoded.  This is common for VTT text input.
           continue
 
@@ -140,14 +145,14 @@ class TranscoderNode(PolitelyWaitOnFinish):
           assert(isinstance(output_stream, TextOutputStream))
           args += self._encode_text(output_stream, input)
 
-        # The output pipe.
-        args += [output_stream.pipe]
+        args += [output_stream.ipc_pipe.write_end()]
 
     env = {}
     if self._pipeline_config.debug_logs:
       # Use this environment variable to turn on ffmpeg's logging.  This is
       # independent of the -loglevel switch above.
-      env['FFREPORT'] = 'file=TranscoderNode.log:level=32'
+      ffmpeg_log_file = 'TranscoderNode-' + str(self._index) + '.log'
+      env['FFREPORT'] = 'file={}:level=32'.format(ffmpeg_log_file)
 
     self._process = self._create_process(args, env)
 
@@ -158,12 +163,12 @@ class TranscoderNode(PolitelyWaitOnFinish):
         '-vn',
         # TODO: This implied downmixing is not ideal.
         # Set the number of channels to the one specified in the config.
-        '-ac', str(stream.channels),
+        '-ac', str(stream.layout.max_channels),
     ]
 
-    if stream.channels == 6:
+    if stream.layout.max_channels == 6:
       filters += [
-        # Work around for https://github.com/google/shaka-packager/issues/598,
+        # Work around for https://github.com/shaka-project/shaka-packager/issues/598,
         # as seen on https://trac.ffmpeg.org/ticket/6974
         'channelmap=channel_layout=5.1',
       ]
@@ -177,8 +182,11 @@ class TranscoderNode(PolitelyWaitOnFinish):
         '-b:a', stream.get_bitrate(),
         # Output MP4 in the pipe, for all codecs.
         '-f', 'mp4',
-        # These flags make it fragmented MP4, which is necessary for a pipe.
-        '-movflags', '+faststart+frag_keyframe',
+        # This explicit fragment duration affects both audio and video, and
+        # ensures that there are no single large MP4 boxes that Shaka Packager
+        # can't consume from a pipe.
+        # FFmpeg fragment duration is in microseconds.
+        '-frag_duration', str(self._pipeline_config.segment_size * 1e6),
         # Opus in MP4 is considered "experimental".
         '-strict', 'experimental',
       ]
@@ -198,6 +206,9 @@ class TranscoderNode(PolitelyWaitOnFinish):
     if input.is_interlaced:
       filters.append('pp=fd')
       args.extend(['-r', str(input.frame_rate)])
+    
+    if stream.resolution.max_frame_rate < input.frame_rate:
+       args.extend(['-r', str(stream.resolution.max_frame_rate)])
 
     filters.extend(input.filters)
 
@@ -218,10 +229,11 @@ class TranscoderNode(PolitelyWaitOnFinish):
     # that are very close to 1, such as 5120:5123.  In HLS, the behavior is
     # worse.  Some of the width values in the playlist wind up off by one,
     # which causes playback failures in ExoPlayer.
-    # https://github.com/google/shaka-streamer/issues/36
+    # https://github.com/shaka-project/shaka-streamer/issues/36
     filters.append('setsar=1:1')
 
-    if stream.codec == VideoCodec.H264:
+    if (stream.codec in {VideoCodec.H264, VideoCodec.HEVC} 
+        and not stream.is_hardware_accelerated()):
       # These presets are specifically recognized by the software encoder.
       if self._pipeline_config.streaming_mode == StreamingMode.LIVE:
         args += [
@@ -236,7 +248,7 @@ class TranscoderNode(PolitelyWaitOnFinish):
             '-flags', '+loop',
         ]
 
-    if stream.codec.get_base_codec() == VideoCodec.H264:  # Software or hardware
+    if stream.codec == VideoCodec.H264:  # Software or hardware
       # Use the "high" profile for HD and up, and "main" for everything else.
       # https://en.wikipedia.org/wiki/Advanced_Video_Coding#Profiles
       if stream.resolution.max_height >= 720:
@@ -245,18 +257,23 @@ class TranscoderNode(PolitelyWaitOnFinish):
         profile = 'main'
 
       args += [
-          # The only format supported by QT/Apple.
-          '-pix_fmt', 'yuv420p',
-          # Require a closed GOP.  Some decoders don't support open GOPs.
-          '-flags', '+cgop',
           # Set the H264 profile.  Without this, the default would be "main".
           # Note that this gets overridden to "baseline" in live streams by the
           # "-preset ultrafast" option, presumably because the baseline encoder
           # is faster.
           '-profile:v', profile,
       ]
+      
+    if stream.codec in {VideoCodec.H264, VideoCodec.HEVC}:
+      args += [
+          # The only format supported by QT/Apple.
+          '-pix_fmt', 'yuv420p',
+          # Require a closed GOP.  Some decoders don't support open GOPs.
+          '-flags', '+cgop',
+         
+      ]
 
-    elif stream.codec.get_base_codec() == VideoCodec.VP9:
+    elif stream.codec == VideoCodec.VP9:
       # TODO: Does -preset apply here?
       args += [
           # According to the wiki (https://trac.ffmpeg.org/wiki/Encode/VP9),
@@ -264,6 +281,8 @@ class TranscoderNode(PolitelyWaitOnFinish):
           # resources and speeds up encoding.  This is still not the default
           # setting as of libvpx v1.7.
           '-row-mt', '1',
+          # speeds up encoding, balancing against quality
+          '-speed', '2',
       ]
     elif stream.codec == VideoCodec.AV1:
       args += [
@@ -296,8 +315,13 @@ class TranscoderNode(PolitelyWaitOnFinish):
         '-b:v', stream.get_bitrate(),
         # Output MP4 in the pipe, for all codecs.
         '-f', 'mp4',
-        # These flags make it fragmented MP4, which is necessary for a pipe.
-        '-movflags', '+faststart+frag_keyframe',
+        # This flag forces a video fragment at each keyframe.
+        '-movflags', '+frag_keyframe',
+        # This explicit fragment duration affects both audio and video, and
+        # ensures that there are no single large MP4 boxes that Shaka Packager
+        # can't consume from a pipe.
+        # FFmpeg fragment duration is in microseconds.
+        '-frag_duration', str(self._pipeline_config.segment_size * 1e6),
         # Set minimum and maximum GOP length.
         '-keyint_min', str(keyframe_interval), '-g', str(keyframe_interval),
         # Set video filters.

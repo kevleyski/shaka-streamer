@@ -18,8 +18,23 @@ import platform
 from . import bitrate_configuration
 from . import configuration
 
-from typing import List, Optional
+from typing import List, Dict, Any, Optional
 
+
+class InputNotFound(configuration.ConfigError):
+  """An error raised when an input stream is not found."""
+
+  def __init__(self, input):
+    super().__init__(input.__class__, 'track_num',
+                     getattr(input.__class__, 'track_num'))
+    self.input = input
+
+  def __str__(self):
+    return ('In {}, {} track #{} was'
+            ' not found in "{}"').format(self.class_name,
+                                         self.input.media_type.value,
+                                         self.input.track_num,
+                                         self.input.name)
 
 class InputType(enum.Enum):
   FILE = 'file'
@@ -37,7 +52,16 @@ class InputType(enum.Enum):
   The device path should be given in the name field.  For example, on Linux,
   this might be /dev/video0.
 
-  Does not support media_type of 'text'.
+  Only supports media_type of 'video'.
+  """
+
+  MICROPHONE = 'microphone'
+  """A microphone device.  Usable only with live.
+
+  The device path should given in the name field.  For example, on Linux, this
+  might be "default".
+
+  Only supports media_type of 'audio'.
   """
 
   EXTERNAL_COMMAND = 'external_command'
@@ -116,6 +140,10 @@ class Input(configuration.Base):
   For example, required for input_type of 'external_command'.
   """
 
+  channel_layout = configuration.Field(
+      bitrate_configuration.AudioChannelLayoutName).cast()
+  """The name of the input channel layout (stereo, surround, etc)."""
+
   track_num = configuration.Field(int, default=0).cast()
   """The track number of the input.
 
@@ -162,6 +190,16 @@ class Input(configuration.Base):
   Not supported with media_type of 'text'.
   """
 
+  drm_label = configuration.Field(str).cast()
+  """Optional value for a custom DRM label, which defines the encryption key
+  applied to the stream. If not provided, the DRM label is derived from stream
+  type (video, audio), resolutions, etc. Note that it is case sensitive.
+
+  Applies to 'raw' encryption_mode only."""
+
+  skip_encryption = configuration.Field(int, default=0).cast()
+  """If set, no encryption of the stream will be made"""
+
   # TODO: Figure out why mypy 0.720 and Python 3.7.5 don't correctly deduce the
   # type parameter here if we don't specify it explicitly with brackets after
   # "Field".
@@ -180,6 +218,9 @@ class Input(configuration.Base):
     # FIXME: A late import to avoid circular dependency issues between these two
     # modules.
     from . import autodetect
+
+    if not autodetect.is_present(self):
+      raise InputNotFound(self)
 
     def require_field(name: str) -> None:
       """Raise MissingRequiredField if the named field is still missing."""
@@ -207,13 +248,17 @@ class Input(configuration.Base):
         self.resolution = autodetect.get_resolution(self)
       require_field('resolution')
 
-    if self.media_type == MediaType.AUDIO or self.media_type == MediaType.TEXT:
-      # Language is required for audio and text inputs.
-      # We will attempt to auto-detect this.
+    if self.media_type == MediaType.AUDIO:
       if self.language is None:
         self.language = autodetect.get_language(self) or 'und'
 
+      if self.channel_layout is None:
+        self.channel_layout = autodetect.get_channel_layout(self)
+      require_field('channel_layout')
+
     if self.media_type == MediaType.TEXT:
+      if self.language is None:
+        self.language = autodetect.get_language(self) or 'und'
       # Text streams are only supported in plain file inputs.
       if self.input_type != InputType.FILE:
         reason = 'text streams are not supported in input_type "{}"'.format(
@@ -233,25 +278,12 @@ class Input(configuration.Base):
       disallow_field('start_time', reason)
       disallow_field('end_time', reason)
 
-    # A path to a pipe into which this input's contents are fed.
-    # None for most input types.
-    self._pipe: Optional[str] = None
 
-  def set_pipe(self, pipe: str) -> None:
-    """Set the path to a pipe into which this input's contents are fed.
-
-    If set, this is what TranscoderNode will read from instead of .name.
+  def reset_name(self, pipe_path: str) -> None:
+    """Set the name to a pipe path into which this input's contents are fed.
     """
 
-    self._pipe = pipe
-
-  def get_path_for_transcode(self) -> str:
-    """Get the path which the transcoder will use to read the input.
-
-    For some input types, this is a named pipe.  For others, this is .name.
-    """
-
-    return self._pipe or self.name
+    self.name = pipe_path
 
   def get_stream_specifier(self) -> str:
     """Get an FFmpeg stream specifier for this input.
@@ -283,32 +315,92 @@ class Input(configuration.Base):
     Note that for types which support autodetect, these arguments must be
     understood by ffprobe as well as ffmpeg.
     """
-    if self.input_type == InputType.WEBCAM:
-      if platform.system() == 'Linux':
-        return [
-            # Treat the input as a video4linux device, which is how webcams show
-            # up on Linux.
-            '-f', 'video4linux2',
-        ]
-      elif platform.system() == 'Darwin':  # AKA macOS
-        return [
-            # Webcams on macOS use FFmpeg's avfoundation input format.  With
-            # this, you also have to specify an input framerate, unfortunately.
-            '-f', 'avfoundation',
-            '-framerate', '30',
-        ]
-      else:
-        assert False, 'Webcams not supported on this platform!'
+    args_matrix: Dict[InputType, Dict[str, List[str]]] = {
+        InputType.WEBCAM: {
+            'Linux': [
+                # Treat the input as a video4linux device, which is how
+                # webcams show up on Linux.
+                '-f', 'video4linux2',
+            ],
+            'Darwin': [
+                # Webcams on macOS use FFmpeg's avfoundation input format.  With
+                # this, you also have to specify an input framerate, unfortunately.
+                '-f', 'avfoundation',
+                '-framerate', '30',
+            ],
+            'Windows': [
+                # Treat the input as a directshow input device.
+                '-f', 'dshow',
+            ],
+        },
+        InputType.MICROPHONE: {
+            'Linux': [
+                # PulseAudio input device.
+                '-f', 'pulse',
+            ],
+            'Darwin': [
+                # AVFoundation also works as an audio input device.
+                '-f', 'avfoundation',
+            ],
+            'Windows': [
+                # Directshow also works as an audio input device.
+                '-f', 'dshow',
+            ],
+        },
+    }
 
-    return []
+    args_for_input_type = args_matrix.get(self.input_type)
+    # If the input's type wasn't of what interests us.
+    if not args_for_input_type:
+      return []
+
+    args = args_for_input_type.get(platform.system())
+    assert args, '{} is not supported on this platform!'.format(self.input_type.value)
+
+    return args
 
   def get_resolution(self) -> bitrate_configuration.VideoResolution:
     return bitrate_configuration.VideoResolution.get_value(self.resolution)
 
+  def get_channel_layout(self) -> bitrate_configuration.AudioChannelLayout:
+    return bitrate_configuration.AudioChannelLayout.get_value(self.channel_layout)
+
+class SinglePeriod(configuration.Base):
+  """An object representing a single period in a multiperiod inputs list."""
+
+  inputs = configuration.Field(List[Input], required=True).cast()
 
 class InputConfig(configuration.Base):
   """An object representing the entire input config to Shaka Streamer."""
 
-  inputs = configuration.Field(List[Input], required=True).cast()
-  """A list of Input objects, one per input stream."""
+  multiperiod_inputs_list = configuration.Field(List[SinglePeriod]).cast()
+  """A list of SinglePeriod objects"""
+
+  inputs = configuration.Field(List[Input]).cast()
+  """A list of Input objects"""
+
+  def __init__(self, dictionary: Dict[str, Any]):
+    """A constructor to check that either inputs or mutliperiod_inputs_list is provided,
+    and produce a helpful error message in case both or none are provided.
+
+    We need these checks before passing the input dictionary to the configuration.Base constructor,
+    because it does not check for this 'exclusive or-ing' relationship between fields.
+    """
+
+    assert isinstance(dictionary, dict), """Malformed Input Config File,
+    See some examples at https://github.com/shaka-project/shaka-streamer/tree/main/config_files.
+    """
+
+    if (dictionary.get('inputs') is not None
+        and dictionary.get('multiperiod_inputs_list') is not None):
+      raise configuration.ConflictingFields(
+        InputConfig, 'inputs', 'multiperiod_inputs_list')
+
+    # Because these fields are not marked as required at the class level
+    # , we need to check ourselves that one of them is provided.
+    if not dictionary.get('inputs') and not dictionary.get('multiperiod_inputs_list'):
+      raise configuration.MissingRequiredExclusiveFields(
+        InputConfig, 'inputs', 'multiperiod_inputs_list')
+
+    super().__init__(dictionary)
 

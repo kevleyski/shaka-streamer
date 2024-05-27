@@ -17,7 +17,7 @@ import math
 import re
 
 from . import configuration
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 
 
 class BitrateString(configuration.ValidatingType, str):
@@ -39,6 +39,8 @@ class AudioCodec(enum.Enum):
 
   AAC: str = 'aac'
   OPUS: str = 'opus'
+  AC3: str = 'ac3'
+  EAC3: str = 'eac3'
 
   def is_hardware_accelerated(self) -> bool:
     """Returns True if this codec is hardware accelerated."""
@@ -57,52 +59,50 @@ class AudioCodec(enum.Enum):
 
   def get_output_format(self) -> str:
     """Returns an FFmpeg output format suitable for this codec."""
-    # TODO: consider Opus in mp4 by default
     # TODO(#31): add support for configurable output format per-codec
-    if self == AudioCodec.OPUS:
-      return 'webm'
-    elif self == AudioCodec.AAC:
+    if (self == AudioCodec.OPUS) or (self == AudioCodec.AAC) or (self == AudioCodec.AC3) or (self == AudioCodec.EAC3):
       return 'mp4'
     else:
       assert False, 'No mapping for output format for codec {}'.format(
           self.value)
 
 
-# TODO: ideally, we wouldn't have to explicitly list hw: variants
 class VideoCodec(enum.Enum):
 
   H264 = 'h264'
   """H264, also known as AVC."""
 
-  HARDWARE_H264 = 'hw:h264'
-  """H264 with hardware encoding."""
-
   VP9 = 'vp9'
   """VP9."""
 
-  HARDWARE_VP9 = 'hw:vp9'
-  """VP9 with hardware encoding."""
-
   AV1 = 'av1'
   """AV1."""
+  
+  HEVC = 'hevc'
+  """HEVC, also known as h.265"""
+
+  def __init__(self, value):
+    # Set all the codecs not to be hardware accelerated at the begining.
+    self._hw_acc = False
+
+  @classmethod
+  def _missing_(cls, value: object) -> 'VideoCodec':
+    if isinstance(value, str) and value.startswith('hw:'):
+      obj = cls(value[3:])
+      # Overwrite the _hw_acc variable for this codec.
+      obj._hw_acc = True
+      return obj
+    return super()._missing_(value)
 
   def is_hardware_accelerated(self) -> bool:
     """Returns True if this codec is hardware accelerated."""
-    return self.value.startswith('hw:')
-
-  def get_base_codec(self) -> 'VideoCodec':
-    """Returns an instance of the same codec without hardware acceleration."""
-    if self.is_hardware_accelerated():
-      value_without_prefix = self.value.split(':')[1]
-      return VideoCodec(value_without_prefix)
-
-    return self
+    return self._hw_acc
 
   def get_ffmpeg_codec_string(self, hwaccel_api: str) -> str:
     """Returns a codec string accepted by FFmpeg for this codec."""
-    if self.is_hardware_accelerated():
+    if self._hw_acc:
       assert hwaccel_api, 'No hardware encoding support on this platform!'
-      return self.get_base_codec().value + '_' + hwaccel_api
+      return self.value + '_' + hwaccel_api
 
     return self.value
 
@@ -110,11 +110,11 @@ class VideoCodec(enum.Enum):
     """Returns an FFmpeg output format suitable for this codec."""
     # TODO: consider VP9 in mp4 by default
     # TODO(#31): add support for configurable output format per-codec
-    if self.get_base_codec() == VideoCodec.VP9:
+    if self == VideoCodec.VP9:
       return 'webm'
-    elif self.get_base_codec() == VideoCodec.H264:
+    elif self in {VideoCodec.H264, VideoCodec.HEVC}:
       return 'mp4'
-    elif self.get_base_codec() == VideoCodec.AV1:
+    elif self == VideoCodec.AV1:
       return 'mp4'
     else:
       assert False, 'No mapping for output format for codec {}'.format(
@@ -147,21 +147,39 @@ class AudioChannelLayout(configuration.RuntimeMap):
 
 
 DEFAULT_AUDIO_CHANNEL_LAYOUTS = {
+  'mono': AudioChannelLayout({
+    'max_channels': 1,
+    'bitrates': {
+      'aac': '64k',
+      'opus': '32k',
+      'ac3': '96k',
+      'eac3': '48k',
+    },
+  }),
   'stereo': AudioChannelLayout({
     'max_channels': 2,
     'bitrates': {
       'aac': '128k',
       'opus': '64k',
+      'ac3': '192k',
+      'eac3': '96k',
     },
   }),
   'surround': AudioChannelLayout({
     'max_channels': 6,
     'bitrates': {
-      'aac': '192k',
-      'opus': '96k',
+      'aac': '256k',
+      'opus': '128k',
+      'ac3': '384k',
+      'eac3': '192k',
     },
   }),
 }
+
+class AudioChannelLayoutName(configuration.RuntimeMapKeyValidator):
+  """A type which will only allow valid AudioChannelLayout names at runtime."""
+
+  map_class = AudioChannelLayout
 
 
 class VideoResolution(configuration.RuntimeMap):
@@ -209,45 +227,55 @@ DEFAULT_VIDEO_RESOLUTIONS = {
   '144p': VideoResolution({
     'max_width': 256,
     'max_height': 144,
+    'max_frame_rate': 30,
     'bitrates': {
       'h264': '108k',
       'vp9': '96k',
+      'hevc': '96k',
       'av1': '72k',
     },
   }),
   '240p': VideoResolution({
     'max_width': 426,
     'max_height': 240,
+    'max_frame_rate': 30,
     'bitrates': {
       'h264': '242k',
       'vp9': '151k',
+      'hevc': '151k',
       'av1': '114k',
     },
   }),
   '360p': VideoResolution({
     'max_width': 640,
     'max_height': 360,
+    'max_frame_rate': 30,
     'bitrates': {
       'h264': '400k',
       'vp9': '277k',
+      'hevc': '277k',
       'av1': '210k',
     },
   }),
   '480p': VideoResolution({  # NTSC analog broadcast TV resolution
     'max_width': 854,
     'max_height': 480,
+    'max_frame_rate': 30,
     'bitrates': {
       'h264': '1M',
       'vp9': '512k',
+      'hevc': '512k',
       'av1': '389k',
     },
   }),
   '576p': VideoResolution({  # PAL analog broadcast TV resolution
     'max_width': 1024,
     'max_height': 576,
+    'max_frame_rate': 30,
     'bitrates': {
       'h264': '1.5M',
       'vp9': '768k',
+      'hevc': '768k',
       'av1': '450k',
     },
   }),
@@ -258,6 +286,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '2M',
       'vp9': '1M',
+      'hevc': '1M',
       'av1': '512k',
     },
   }),
@@ -267,6 +296,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '3M',
       'vp9': '2M',
+      'hevc': '2M',
       'av1': '778k',
     },
   }),
@@ -277,6 +307,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '4M',
       'vp9': '2M',
+      'hevc': '2M',
       'av1': '850k',
     },
   }),
@@ -286,6 +317,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '5M',
       'vp9': '3M',
+      'hevc': '3M',
       'av1': '1M',
     },
   }),
@@ -296,6 +328,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '9M',
       'vp9': '6M',
+      'hevc': '6M',
       'av1': '3.5M',
     },
   }),
@@ -305,6 +338,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '14M',
       'vp9': '9M',
+      'hevc': '9M',
       'av1': '5M',
     },
   }),
@@ -315,6 +349,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '17M',
       'vp9': '12M',
+      'hevc': '12M',
       'av1': '6M',
     },
   }),
@@ -324,6 +359,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '25M',
       'vp9': '18M',
+      'hevc': '18M',
       'av1': '9M',
     },
   }),
@@ -334,6 +370,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '40M',
       'vp9': '24M',
+      'hevc': '24M',
       'av1': '12M',
     },
   }),
@@ -343,6 +380,7 @@ DEFAULT_VIDEO_RESOLUTIONS = {
     'bitrates': {
       'h264': '60M',
       'vp9': '36M',
+      'hevc': '36M',
       'av1': '18M',
     },
   }),

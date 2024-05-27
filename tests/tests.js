@@ -13,13 +13,15 @@
 // limitations under the License.
 
 const flaskServerUrl = 'http://localhost:5000/';
+const outputHttpUrl = 'http://localhost:80/';
 const dashManifestUrl = flaskServerUrl + 'output_files/dash.mpd';
 const hlsManifestUrl = flaskServerUrl + 'output_files/hls.m3u8';
+const OUTPUT_DIR = 'output_files/'
 const TEST_DIR = 'test_assets/';
 let player;
 let video;
 
-async function startStreamer(inputConfig, pipelineConfig, bitrateConfig={}) {
+async function startStreamer(inputConfig, pipelineConfig, bitrateConfig={}, outputLocation=OUTPUT_DIR) {
   // Send a request to flask server to start Shaka Streamer.
   const response = await fetch(flaskServerUrl + 'start', {
     method: 'POST',
@@ -30,6 +32,7 @@ async function startStreamer(inputConfig, pipelineConfig, bitrateConfig={}) {
       'input_config': inputConfig,
       'pipeline_config': pipelineConfig,
       'bitrate_config': bitrateConfig,
+      'output_location': outputLocation
     }),
   });
 
@@ -67,6 +70,12 @@ describe('Shaka Streamer', () => {
     document.body.appendChild(video);
 
     player = new shaka.Player(video);
+    const retryParameters = {
+      maxAttempts: 5,
+      timeout: 90e3,
+      stallTimeout: 30e3,
+    };
+    player.configure('manifest.retryParameters', retryParameters);
     player.addEventListener('error', (error) => {
       fail(error);
     });
@@ -106,10 +115,10 @@ describe('Shaka Streamer', () => {
   vodTests(hlsManifestUrl, '(hls)');
   vodTests(dashManifestUrl, '(dash)');
 
-  channelsTests(hlsManifestUrl, 2, '(hls)');
-  channelsTests(dashManifestUrl, 2, '(dash)');
-  channelsTests(hlsManifestUrl, 6, '(hls)');
-  channelsTests(dashManifestUrl, 6, '(dash)');
+  channelsTests(hlsManifestUrl, ['stereo'], 2, '(hls)');
+  channelsTests(dashManifestUrl, ['stereo'], 2, '(dash)');
+  channelsTests(hlsManifestUrl, ['surround'], 6, '(hls)');
+  channelsTests(dashManifestUrl, ['surround'], 6, '(dash)');
 
   // The HLS manifest does not indicate the availability window, so only test
   // this in DASH.
@@ -130,8 +139,9 @@ describe('Shaka Streamer', () => {
   mapTests(dashManifestUrl, '(dash)');
 
   // The player doesn't have any framerate or other metadata from an HLS
-  // manifest that would let us detect our filters, so only test this in DASH.
+  // manifest that would let us detect our filters, so only test these in DASH.
   filterTests(dashManifestUrl, '(dash)');
+  outputFramerateTests(dashManifestUrl, '(dash)');
 
   // TODO: Add tests for interlaced video.  We need interlaced source material
   // for this.
@@ -141,6 +151,11 @@ describe('Shaka Streamer', () => {
   // TODO: Test is commented out until Packager outputs codecs for vtt in mp4.
   // muxedTextTests(hlsManifestUrl, '(hls)');
   muxedTextTests(dashManifestUrl, '(dash)');
+
+  multiPeriodTests(dashManifestUrl, '(dash)');
+  multiPeriodTests(hlsManifestUrl, '(hls)');
+
+  lowLatencyDashTests(dashManifestUrl, '(dash)');
 });
 
 function errorTests() {
@@ -160,6 +175,7 @@ function errorTests() {
   const minimalPipelineConfig = {
     streaming_mode: 'vod',
     resolutions: ['144p'],
+    channel_layouts: ['stereo'],
   };
 
   it('fails when extra fields are present', async () => {
@@ -288,7 +304,6 @@ function errorTests() {
     const inputConfig = getBasicInputConfig();
     const pipelineConfig = {
       streaming_mode: 'live',
-      resolutions: [],
       segment_per_file: false,
     };
 
@@ -303,7 +318,6 @@ function errorTests() {
     const inputConfig = getBasicInputConfig();
     const pipelineConfig = {
       streaming_mode: 'vod',
-      resolutions: [],
       encryption: {
         enable: true,
         content_id: 'foo',
@@ -314,6 +328,96 @@ function errorTests() {
         .toBeRejectedWith(jasmine.objectContaining({
           error_type: 'MalformedField',
           field_name: 'content_id',
+        }));
+  });
+
+  it('fails when both "inputs" and "multiperiod_inputs_list" are given', async() => {
+    const inputConfig = getBasicInputConfig();
+    inputConfig.multiperiod_inputs_list = [
+      getBasicInputConfig(),
+      getBasicInputConfig(),
+    ];
+    const pipeline_config = {
+      streaming_mode: 'vod',
+    };
+
+    await expectAsync(startStreamer(inputConfig, pipeline_config))
+        .toBeRejectedWith(jasmine.objectContaining({
+          error_type: 'ConflictingFields',
+          field_name: 'inputs',
+        }));
+  });
+
+  it('fails when neither "inputs" nor "multiperiod_inputs_list" is given', async() => {
+    const inputConfig = {};
+    const pipeline_config = {
+      streaming_mode: 'vod',
+    };
+
+    await expectAsync(startStreamer(inputConfig, pipeline_config))
+        .toBeRejectedWith(jasmine.objectContaining({
+          error_type: 'MissingRequiredExclusiveFields',
+          field_name: 'inputs',
+        }));
+  });
+
+  it('fails when segment_per_file is false with a HTTP url output', async () => {
+    const inputConfig = getBasicInputConfig();
+    const pipelineConfig = {
+      streaming_mode: 'vod',
+      resolutions: [],
+      segment_per_file: false,
+    };
+
+    await expectAsync(startStreamer(inputConfig, pipelineConfig, {}, outputHttpUrl))
+    .toBeRejectedWith(jasmine.objectContaining({
+      error_type: 'RuntimeError',
+    }));
+  });
+
+  it('fails when multiperiod_inputs_list is used with a HTTP url output', async () => {
+    const inputConfig = {
+      'multiperiod_inputs_list': [
+        getBasicInputConfig(),
+      ],
+    };
+
+    await expectAsync(startStreamer(inputConfig, minimalPipelineConfig, {}, outputHttpUrl))
+        .toBeRejectedWith(jasmine.objectContaining({
+          error_type: 'RuntimeError',
+        }));
+  });
+
+  it('fails when utc_timing is not set for low_latency_dash_mode', async () => {
+    const inputConfig = getBasicInputConfig();
+    const pipelineConfig = {
+      low_latency_dash_mode: true,
+      streaming_mode: 'live',
+    };
+
+    await expectAsync(startStreamer(inputConfig, pipelineConfig))
+        .toBeRejectedWith(jasmine.objectContaining({
+          error_type: 'RuntimeError',
+        }));
+  });
+
+  it('fails when low_latency_dash_mode is set without a DASH manifest', async () => {
+    const inputConfig = getBasicInputConfig();
+    const pipelineConfig = {
+      low_latency_dash_mode: true,
+      manifest_format: ['hls'],
+      streaming_mode: 'live',
+      utc_timings: [
+        {
+          scheme_id_uri:'urn:mpeg:dash:utc:http-xsdate:2014',
+          value:'https://time.akamai.com/?.iso'
+        },
+      ],
+    };
+
+    await expectAsync(startStreamer(inputConfig, pipelineConfig))
+        .toBeRejectedWith(jasmine.objectContaining({
+          error_type: 'RuntimeError',
         }));
   });
 }
@@ -356,6 +460,48 @@ function resolutionTests(manifestUrl, format) {
   });
 }
 
+function outputFramerateTests(manifestUrl, format) {
+  it('has output framerate not exceeding configured maximum ' + format,
+      async () => {
+    const inputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'BigBuckBunny.1080p.mp4',
+          'media_type': 'video',
+          'resolution': 'very_small',
+          // Keep this test short by only encoding 1s of content.
+          'end_time': '0:01',
+        },
+      ]
+    };
+    const bitrateConfigDict = {
+      video_resolutions: {
+        very_small: {
+          max_width: 256,
+          max_height: 144,
+          max_frame_rate: 25,
+          bitrates: {
+            h264: '108k'
+          }
+        }
+      }
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'vod',
+      'resolutions': [
+        'very_small'
+      ],
+    };
+
+    await startStreamer(inputConfigDict, pipelineConfigDict, bitrateConfigDict);
+    await player.load(manifestUrl);
+
+    const trackList = player.getVariantTracks();
+    expect(trackList[0].frameRate).toBe(25);
+
+  });
+}
+
 function liveTests(manifestUrl, format) {
   it('has a live streaming mode ' + format, async () => {
     const inputConfigDict = {
@@ -378,7 +524,7 @@ function liveTests(manifestUrl, format) {
 }
 
 function drmTests(manifestUrl, format) {
-  it('has encryption enabled ' + format, async () => {
+  it('has widevine encryption enabled ' + format, async () => {
     const inputConfigDict = {
       'inputs': [
         {
@@ -416,9 +562,150 @@ function drmTests(manifestUrl, format) {
     // Player should now be able to load because the player has a license server.
     await player.load(manifestUrl);
   });
+
+  it('has raw key encryption enabled ' + format, async () => {
+    // Clear Key format is not supported in HLS with Shaka Player yet
+    // so for now we bypass the hls tests.
+    // See: https://github.com/shaka-project/shaka-player/issues/2146
+    if (manifestUrl.indexOf('hls.m3u8') !== -1) {
+      return pending();
+    }
+    const inputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'BigBuckBunny.1080p.mp4',
+          'media_type': 'video',
+          // Keep this test short by only encoding 1s of content.
+          'end_time': '0:01',
+        },
+      ]
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'vod',
+      'resolutions': ['144p'],
+      'encryption': {
+        // Enables encryption.
+        'enable': true,
+        // Enables raw keys
+        'encryption_mode': 'raw',
+        'keys': [
+          {
+            'key_id': '1e044b199a81850e1927e776e7228cad',
+            'key': '0c3b6b7882ecbf9683bd34e189a5acf8',
+          }
+        ],
+        'clear_lead': 0,
+      },
+    };
+    await startStreamer(inputConfigDict, pipelineConfigDict);
+    // Player should raise an error and not load because the media
+    // is encrypted and the player doesn't have a license server.
+    await expectAsync(player.load(manifestUrl)).toBeRejectedWith(
+        jasmine.objectContaining({
+          code: shaka.util.Error.Code.NO_LICENSE_SERVER_GIVEN,
+        }));
+
+    player.configure({
+      drm: {
+        clearKeys: {
+          '1e044b199a81850e1927e776e7228cad': '0c3b6b7882ecbf9683bd34e189a5acf8'
+        },
+      },
+    });
+    // Player should now be able to load because the player has a license server.
+    await player.load(manifestUrl);
+  });
+
+  it('has raw key drm label support ' + format, async () => {
+    // Clear Key format is not supported in HLS with Shaka Player yet
+    // so for now we bypass the hls tests.
+    // See: https://github.com/shaka-project/shaka-player/issues/2146
+    if (manifestUrl.indexOf('hls.m3u8') !== -1) {
+      return pending();
+    }
+    const inputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'BigBuckBunny.1080p.mp4',
+          'media_type': 'video',
+          // Keep this test short by only encoding 1s of content.
+          'end_time': '0:01',
+        },
+      ]
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'vod',
+      'resolutions': ['144p'],
+      'encryption': {
+        // Enables encryption.
+        'enable': true,
+        // Enables raw keys
+        'encryption_mode': 'raw',
+        'keys': [
+          {
+            'label': 'SD',
+            'key_id': '1e044b199a81850e1927e776e7228cad',
+            'key': '0c3b6b7882ecbf9683bd34e189a5acf8',
+          }
+        ],
+        'clear_lead': 0,
+      },
+    };
+    await startStreamer(inputConfigDict, pipelineConfigDict);
+    // Player should raise an error and not load because the media
+    // is encrypted and the player doesn't have a license server.
+    await expectAsync(player.load(manifestUrl)).toBeRejectedWith(
+        jasmine.objectContaining({
+          code: shaka.util.Error.Code.NO_LICENSE_SERVER_GIVEN,
+        }));
+
+    player.configure({
+      drm: {
+        clearKeys: {
+          '1e044b199a81850e1927e776e7228cad': '0c3b6b7882ecbf9683bd34e189a5acf8'
+        },
+      },
+    });
+    // Player should now be able to load because the player has a license server.
+    await player.load(manifestUrl);
+  });
 }
 
 function codecTests(manifestUrl, format) {
+  // Returns the audio codecs and video codecs, in that order.
+  // Will not fail due to a lack of browser support for any codec.
+  async function getAudioAndVideoCodecs(manifestUrl) {
+    // In case the browser can't play it, check the manifest early in the
+    // loading of the content.  We should at least be able to check the tracks
+    // before they are filtered out.
+    let codecs = null;
+    player.addEventListener('manifestparsed', () => {
+      const trackList = player.getVariantTracks();
+      const audioCodecList = trackList.map(track => track.audioCodec)
+          .filter((x) => x != null);
+      const videoCodecList = trackList.map(track => track.videoCodec)
+          .filter((x) => x != null);
+      codecs = audioCodecList.concat(videoCodecList);
+    });
+
+    try {
+      await player.load(manifestUrl);
+    } catch (error) {
+      // It's fine if the browser can't play any given codec.
+      // Most browsers won't play HEVC, for example, as of 2021-06-08.
+      // Any other error should be propagated up and fail the test.
+      if (error.code != shaka.util.Error.Code.CONTENT_UNSUPPORTED_BY_BROWSER) {
+        throw error;
+      }
+    }
+
+    // Ensure that our event handler fired.  If not, fail the test.
+    if (codecs == null) {
+      throw new Error('manifestparsed event never fired!');
+    }
+    return codecs;
+  }
+
   it('has output codecs matching the codecs in config ' + format, async () => {
     const inputConfigDict = {
       'inputs': [
@@ -439,17 +726,14 @@ function codecTests(manifestUrl, format) {
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
       'resolutions': ['144p'],
+      'channel_layouts': ['stereo'],
       'audio_codecs': ['aac'],
       'video_codecs': ['h264'],
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
-    await player.load(manifestUrl);
 
-    const trackList = player.getVariantTracks();
-    const videoCodecList = trackList.map(track => track.videoCodec);
-    const audioCodecList = trackList.map(track => track.audioCodec);
-    expect(videoCodecList).toEqual(['avc1.4d400c']);
-    expect(audioCodecList).toEqual(['mp4a.40.2']);
+    const codecList = await getAudioAndVideoCodecs(manifestUrl);
+    expect(codecList).toEqual(['mp4a.40.2', 'avc1.4d400c']);
   });
 
   it('supports AV1 ' + format, async () => {
@@ -469,12 +753,60 @@ function codecTests(manifestUrl, format) {
       'video_codecs': ['av1'],
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
-    await player.load(manifestUrl);
 
-    const trackList = player.getVariantTracks();
-    const videoCodecList = trackList.map(track => track.videoCodec);
-    expect(videoCodecList).toEqual(['av01.0.00M.08']);
+    const codecList = await getAudioAndVideoCodecs(manifestUrl);
+    expect(codecList).toEqual(['av01.0.00M.08']);
   });
+
+  it('supports HEVC ' + format, async () => {
+    const inputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'Sintel.2010.720p.Small.mkv',
+          'media_type': 'video',
+          // Keep this test short by only encoding 1s of content.
+          'end_time': '0:01',
+        },
+      ],
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'vod',
+      'resolutions': ['144p'],
+      'video_codecs': ['hevc'],
+    };
+    await startStreamer(inputConfigDict, pipelineConfigDict);
+
+    let codecList = await getAudioAndVideoCodecs(manifestUrl);
+    // In HLS, we get "hvc1", but in DASH, it's "hev1".  Accept both.
+    codecList = codecList.map((x) => x.replace('hvc1', 'hev1'));
+    expect(codecList).toEqual(['hev1.1.6.L60.90']);
+  });
+
+  it('appropriately filters WebM formats ' + format, async () => {
+    const inputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'Sintel.2010.720p.Small.mkv',
+          'media_type': 'audio',
+          // Keep this test short by only encoding 1s of content.
+          'end_time': '0:01',
+        },
+      ],
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'vod',
+      'channel_layouts': ['stereo'],
+      'audio_codecs': ['aac', 'opus'],
+    };
+    await startStreamer(inputConfigDict, pipelineConfigDict);
+
+    let codecList = await getAudioAndVideoCodecs(manifestUrl);
+    if (manifestUrl == hlsManifestUrl) {
+      expect(codecList).not.toContain('opus');
+    } else if (manifestUrl == dashManifestUrl) {
+      expect(codecList).toContain('opus');
+    }
+  })
 }
 
 function autoDetectionTests(manifestUrl) {
@@ -493,7 +825,7 @@ function autoDetectionTests(manifestUrl) {
     };
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
-      'resolutions': [],
+      'channel_layouts': ['stereo'],
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
     await player.load(manifestUrl);
@@ -509,9 +841,9 @@ function autoDetectionTests(manifestUrl) {
     const inputConfigDict = {
       'inputs': [
         {
-          // NOTE: https://github.com/google/shaka-packager/issues/662 prevents
-          // this from working on Sintel.2010.720p.Small.mkv.  The Packager bug
-          // does not seem to affect typical inputs.
+          // NOTE: https://github.com/shaka-project/shaka-packager/issues/662
+          // prevents this from working on Sintel.2010.720p.Small.mkv.  The
+          // Packager bug does not seem to affect typical inputs.
           'name': TEST_DIR + 'BigBuckBunny.1080p.mp4',
           'media_type': 'video',
           // Keep this test short by only encoding 1s of content.
@@ -645,7 +977,7 @@ function languageTests(manifestUrl, format) {
     };
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
-      'resolutions': [],
+      'channel_layouts': ['stereo'],
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
     await player.load(manifestUrl);
@@ -729,8 +1061,8 @@ function vodTests(manifestUrl, format) {
   });
 }
 
-function channelsTests(manifestUrl, channels, format) {
-  it('outputs ' + channels + ' channels ' + format, async () => {
+function channelsTests(manifestUrl, channel_layouts, expected_channel_count, format) {
+  it('outputs ' + channel_layouts + ' channels ' + format, async () => {
     const inputConfigDict = {
       // List of inputs. Each one is a dictionary.
       'inputs': [
@@ -745,14 +1077,13 @@ function channelsTests(manifestUrl, channels, format) {
 
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
-      'resolutions': [],
-      'channels': channels,
+      'channel_layouts': channel_layouts,
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
     await player.load(manifestUrl);
     const trackList = player.getVariantTracks();
     expect(trackList.length).toBe(1);
-    expect(trackList[0].channelsCount).toBe(channels);
+    expect(trackList[0].channelsCount).toBe(expected_channel_count);
   });
 }
 
@@ -886,6 +1217,7 @@ function mapTests(manifestUrl, format) {
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
       'resolutions': ['144p'],
+      'channel_layouts': ['stereo'],
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
     await player.load(manifestUrl);
@@ -929,6 +1261,7 @@ function filterTests(manifestUrl, format) {
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
       'resolutions': ['144p'],
+      'channel_layouts': ['stereo'],
     };
     await startStreamer(inputConfigDict, pipelineConfigDict);
     await player.load(manifestUrl);
@@ -1057,6 +1390,7 @@ function muxedTextTests(manifestUrl, format) {
     const pipelineConfigDict = {
       'streaming_mode': 'vod',
       'resolutions': ['144p'],
+      'channel_layouts': ['stereo'],
       'audio_codecs': ['aac'],
       'video_codecs': ['h264'],
     };
@@ -1069,5 +1403,80 @@ function muxedTextTests(manifestUrl, format) {
         'language': 'eo',  // Autodetected from the mkv input
       }),
     ]);
+  });
+}
+
+function multiPeriodTests(manifestUrl, format) {
+  it('can process multiperiod_inputs_list ' + format, async() => {
+    const singleInputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'Sintel.with.subs.mkv',
+          'media_type': 'video',
+          // Keep this test short by only encoding 1s of content.
+          'end_time': '0:01',
+        },
+      ],
+    };
+    const inputConfigDict = {
+      'multiperiod_inputs_list': [
+        singleInputConfigDict,
+        singleInputConfigDict,
+      ],
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'vod',
+      'resolutions': ['144p'],
+      'audio_codecs': ['aac'],
+      'video_codecs': ['h264'],
+    };
+
+    await startStreamer(inputConfigDict, pipelineConfigDict);
+    await player.load(manifestUrl);
+
+    // Since we processed only 0:01s, the total duration shoud be 2s.
+    // Be more tolerant with float comparison.
+    // Use (D > 1.9 * length) instead of (D == 2 * length).
+    expect(video.duration).toBeGreaterThan(1.9);
+  });
+}
+
+function lowLatencyDashTests(manifestUrl, format) {
+  it('can process LL-DASH streaming ' + format, async() => {
+    const inputConfigDict = {
+      'inputs': [
+        {
+          'name': TEST_DIR + 'BigBuckBunny.1080p.mp4',
+          'media_type': 'video',
+          // Keep this test short by only encoding 4s of content.
+          'end_time': '0:04',
+        }
+      ],
+    };
+    const pipelineConfigDict = {
+      'streaming_mode': 'live',
+      'resolutions': ['144p'],
+      'video_codecs': ['h264'],
+      'manifest_format': ['dash'],
+      'segment_size': 2,
+      'low_latency_dash_mode': true,
+      'utc_timings': [
+        {
+          'scheme_id_uri':'urn:mpeg:dash:utc:http-xsdate:2014',
+          'value':'https://time.akamai.com/?.iso'
+        },
+      ],
+    };
+    await startStreamer(inputConfigDict, pipelineConfigDict);
+
+    // TODO(CaitlinO'Callaghan): fix so player loads and test passes
+    player.configure({
+      streaming: {
+        lowLatencyMode: true,
+        inaccurateManifestTolerance: 0,
+        rebufferingGoal: 0.01,
+      }
+    });
+    await player.load(manifestUrl);
   });
 }

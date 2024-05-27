@@ -30,11 +30,11 @@ from typing import Any, Dict, IO, List, Optional, Union
 class ProcessStatus(enum.Enum):
   # Use number values so we can sort based on value.
 
-  Running = 0
-  """The node is still running."""
-
-  Finished = 1
+  Finished = 0
   """The node has completed its task and shut down."""
+
+  Running = 1
+  """The node is still running."""
 
   Errored = 2
   """The node has failed."""
@@ -67,7 +67,7 @@ class NodeBase(object):
                       merge_env: bool = True,
                       stdout: Union[int, IO[Any], None] = None,
                       stderr: Union[int, IO[Any], None] = None,
-                      shell: bool = False) -> subprocess.Popen:
+                      shell: bool = False, **kwargs) -> subprocess.Popen:
     """A central point to create subprocesses, so that we can debug the
     command-line arguments.
 
@@ -91,12 +91,8 @@ class NodeBase(object):
     # This makes it easy to see the arguments and easy to copy/paste them for
     # debugging in a shell.
     if shell:
-      assert type(args) is str
-      # The type checker doesn't seem to be able to determine from the assert
-      # that the type of args is str in this case. The explicit cast is a
-      # workaround for that.
-      # TODO: Look for a better way to do it.
-      print('+ ' + str(args))
+      assert isinstance(args, str)
+      print('+ ' + args)
     else:
       assert type(args) is list
       print('+ ' + ' '.join([shlex.quote(arg) for arg in args]))
@@ -106,7 +102,7 @@ class NodeBase(object):
                             env=child_env,
                             stdin=subprocess.DEVNULL,
                             stdout=stdout, stderr=stderr,
-                            shell=shell)
+                            shell=shell, **kwargs)
 
   def check_status(self) -> ProcessStatus:
     """Returns the current ProcessStatus of the node."""
@@ -164,11 +160,12 @@ class ThreadedNodeBase(NodeBase):
   The thread repeats some callback in a background thread.
   """
 
-  def __init__(self, thread_name: str, continue_on_exception: bool):
+  def __init__(self, thread_name: str, continue_on_exception: bool, sleep_time: float):
     super().__init__()
     self._status = ProcessStatus.Finished
     self._thread_name = thread_name
     self._continue_on_exception = continue_on_exception
+    self._sleep_time = sleep_time
     self._thread = threading.Thread(target=self._thread_main, name=thread_name)
 
   def _thread_main(self) -> None:
@@ -179,17 +176,17 @@ class ThreadedNodeBase(NodeBase):
         print('Exception in', self._thread_name, '-', sys.exc_info())
 
         if self._continue_on_exception:
-          print('Continuing.')
+          print(self.__class__.__name__+": 'Continuing.'")
         else:
-          print('Quitting.')
+          print(self.__class__.__name__+": 'Quitting.'")
           self._status = ProcessStatus.Errored
           return
 
-      # Yield time to other threads.
-      time.sleep(1)
+      # Wait a little bit before performing the next pass.
+      time.sleep(self._sleep_time)
 
   @abc.abstractmethod
-  def _thread_single_pass(self):
+  def _thread_single_pass(self) -> None:
     """Runs a single step of the thread loop.
 
     This is implemented by subclasses to do whatever it is they do.  It will be
